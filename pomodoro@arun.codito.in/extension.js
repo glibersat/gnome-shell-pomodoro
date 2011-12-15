@@ -65,11 +65,115 @@ function Indicator() {
     this._init.apply(this, arguments);
 }
 
+const PomodoroNotifierIface = {
+    name: 'org.gnome.shell.Pomodoro',
+    methods: [{
+	name: 'startWorksession',
+	inSignature: 'i',
+	outSignature: '',
+    }, {
+	name: 'endWorksession',
+	inSignature: '',
+	outSignature: '',
+    }, {
+	name: 'startBreak',
+	inSignature: 'i',
+	outSignature: '',
+    }, {
+	name: 'endBreak',
+	inSignature: '',
+	outSignature: '',
+    }],
+
+    signals: [{
+	name: 'worksession_started',
+	inSignature: 'i',
+    }, {
+	name: 'worksession_ended',
+	inSignature: '',
+    }, {
+	name: 'break_started',
+	inSignature: 'i',
+    }, {
+	name: 'break_ended',
+	inSignature: '',
+    }],
+};
+
+function PomodoroNotifierServer() {
+    this._init();
+}
+
+PomodoroNotifierServer.prototype = {
+    _init: function() {
+	DBus.session.exportObject('/org/gnome/shell/Pomodoro', this);
+	DBus.conformExport(PomodoroNotifierServer.prototype, PomodoroNotifierIface);
+	DBus.session.acquire_name('org.gnome.shell.Pomodoro', 0, null, null);
+    },
+    //-- Methods --
+    // Worksession
+    startWorksession: function(message) {
+	this._emitWorksession_start(message);
+    },
+
+    endWorksession: function(message) {
+	this._emitWorksession_end(message);
+    },
+
+    // Breaks
+    startBreak: function(message) {
+	this._emitBreak_start(message);
+    },
+
+    endBreak: function(message) {
+	this._emitBreak_end(message);
+    },
+    
+    //-- Signals --
+    // Worksession signals
+    _emitWorksession_start: function(message) {
+	DBus.session.emit_signal('/org/gnome/shell/Pomodoro',
+				 'org.gnome.shell.Pomodoro',
+				 'worksession_start', 'i',
+				 [message]
+				);
+    },
+
+    _emitWorksession_end: function(message) {
+	DBus.session.emit_signal('/org/gnome/shell/Pomodoro',
+				 'org.gnome.shell.Pomodoro',
+				 'worksession_end', '',
+				 [message]
+				);
+    },
+
+    // Break signals
+    _emitBreak_start: function(message) {
+	DBus.session.emit_signal('/org/gnome/shell/Pomodoro',
+				 'org.gnome.shell.Pomodoro',
+				 'break_start', 'i',
+				 [message]
+				);
+    },
+
+    _emitBreak_end: function(message) {
+	DBus.session.emit_signal('/org/gnome/shell/Pomodoro',
+				 'org.gnome.shell.Pomodoro',
+				 'break_end', '',
+				 [message]
+				);
+    },
+
+};
+
 Indicator.prototype = {
     __proto__: PanelMenu.Button.prototype,
 
     _init: function() {
         PanelMenu.Button.prototype._init.call(this, St.Align.START);
+
+	// DBus server
+	this._dbus_server = new PomodoroNotifierServer();
 
         // Set default values of options, and then override from config file
         this._parseConfig();
@@ -458,6 +562,14 @@ Indicator.prototype = {
         if (this._timerSource == undefined) {
             this._timerSource = Mainloop.timeout_add_seconds(1, Lang.bind(this, this._refreshTimer));
             this._isRunning = true;
+
+	    // Trigger dbus signals
+	    if ( this._isPause )
+		this._dbus_server._emitBreak_start(this._menutes * 60 + this._seconds);
+	    else
+		this._dbus_server._emitWorksession_start(this._minutes * 60 + this._seconds);
+
+
             this._updateTimer();
             this._updateSessionCount();
         }
@@ -467,9 +579,9 @@ Indicator.prototype = {
         if (this._timerSource != undefined) {
             GLib.source_remove(this._timerSource);
             this._timerSource = undefined;
-            this._isRunning = false;
+            this._isRunning = false;	    
             this._updateTimer();
-            this._updateSessionCount();            
+            this._updateSessionCount();
             this._closeNotification();
         }
     },
@@ -531,8 +643,9 @@ Indicator.prototype = {
                 this._sessionCount += 1;
                 this._isPause = true;
                 this._updateSessionCount();
-            }
-        }
+
+	    }
+	}
     },
 
     _updateSessionCount: function() {
