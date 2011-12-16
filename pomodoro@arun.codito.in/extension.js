@@ -110,6 +110,7 @@ PomodoroNotifierServer.prototype = {
 	DBus.conformExport(PomodoroNotifierServer.prototype, PomodoroNotifierIface);
 	DBus.session.acquire_name('org.gnome.shell.Pomodoro', 0, null, null);
     },
+
     //-- Methods --
     // Worksession
     startWorksession: function(message) {
@@ -565,10 +566,9 @@ Indicator.prototype = {
 
 	    // Trigger dbus signals
 	    if ( this._isPause )
-		this._dbus_server._emitBreak_start(this._menutes * 60 + this._seconds);
+		this._dbus_server._emitBreak_start(this._pauseTime - this_timeSpent);
 	    else
-		this._dbus_server._emitWorksession_start(this._minutes * 60 + this._seconds);
-
+		this._dbus_server._emitWorksession_start(this._pomodoroTime - this._timeSpent);
 
             this._updateTimer();
             this._updateSessionCount();
