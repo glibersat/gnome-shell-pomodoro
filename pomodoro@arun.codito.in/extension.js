@@ -25,8 +25,11 @@ const Gio = imports.gi.Gio;
 //const GConf = imports.gi.GConf;
 const Pango = imports.gi.Pango;
 const St = imports.gi.St;
+const Meta = imports.gi.Meta;
+const Gtk = imports.gi.Gtk;
 const Util = imports.misc.util;
 const GnomeSession = imports.misc.gnomeSession;
+const ScreenSaver = imports.misc.screenSaver;
 const ExtensionSystem = imports.ui.extensionSystem;
 
 const Main = imports.ui.main;
@@ -41,25 +44,46 @@ const _ = Gettext.gettext;
 let _useKeybinder = true;
 try { const Keybinder = imports.gi.Keybinder; } catch (error) { _useKeybinder = false; }
 
-//const SESSION_SCHEMA = 'org.gnome.desktop.session';
-//const SESSION_IDLE_DELAY_KEY = 'idle-delay';
-
-const SESSION_SCHEMA = 'org.gnome.desktop.session';
-const SESSION_IDLE_DELAY_KEY = 'idle-delay';
-
-const PAUSE_IDLE_DELAY = 60;
 
 let _configVersion = "0.1";
 let _configOptions = [ // [ <variable>, <config_category>, <actual_option>, <default_value> ]
     ["_pomodoroTime", "timer", "pomodoro_duration", 1500],
     ["_shortPauseTime", "timer", "short_pause_duration", 300],
     ["_longPauseTime", "timer", "long_pause_duration", 900],
-    ["_showCountdownTimer", "ui", "show_countdown_timer", true],
-    ["_showNotificationMessages", "ui", "show_messages", true],
+    ["_awayFromDesk", "ui", "away_from_desk", false],
     ["_showDialogMessages", "ui", "show_dialog_messages", true],
     ["_playSound", "ui", "play_sound", true],
     ["_keyToggleTimer", "ui", "key_toggle_timer", "<Ctrl><Alt>P"],
 ];
+
+
+function NotificationSource() {
+    this._init();
+}
+
+NotificationSource.prototype = {
+    __proto__:  MessageTray.Source.prototype,
+    
+    _init: function() {
+        MessageTray.Source.prototype._init.call(this, _('Pomodoro Timer'));
+        
+        this._setSummaryIcon(this.createNotificationIcon());
+        
+        // Add ourselves as a source.
+        Main.messageTray.add(this);
+    },
+
+    createNotificationIcon: function() {
+        return new St.Icon({ icon_name: 'timer',
+                             icon_type: St.IconType.SYMBOLIC,
+                             icon_size: this.ICON_SIZE });
+    },
+
+    open: function(notification) {
+        this.destroyNonResidentNotifications();
+    }
+}
+
 
 function Indicator() {
     this._init.apply(this, arguments);
@@ -181,8 +205,6 @@ Indicator.prototype = {
 
         this._timer = new St.Label({ style_class: 'extension-pomodoro-label' });
         this._timeSpent = 0;
-        this._minutes = 0;
-        this._seconds = 0;
         this._isRunning = false;
         this._isPause = false;
         this._isIdle = false;
@@ -192,16 +214,15 @@ Indicator.prototype = {
         this._labelMsg = new St.Label({ text: 'Stopped'});
         this._notification = null;
         this._dialog = null;
-        this._notifiedIdle = false;
         this._timerSource = undefined;
+        this._eventCaptureId = 0;
+        this._eventCaptureSource = 0;
+        this._pointer = null;
         
         // Set default menu
         this._timer.clutter_text.set_line_wrap(false);
         this._timer.clutter_text.set_ellipsize(Pango.EllipsizeMode.NONE);
         this.actor.add_actor(this._timer);
-
-        // Set initial width of the timer label
-        this._timer.connect('realize', Lang.bind(this, this._onTimerRealize));
 
         // Toggle timer state button
         this._timerToggle = new PopupMenu.PopupSwitchMenuItem(_("Pomodoro Timer"), false, { style_class: 'popup-subtitle-menu-item' });
@@ -287,12 +308,11 @@ Indicator.prototype = {
             },]);
 
         // GNOME Session
-        this._sessionSettings = new Gio.Settings({ schema: SESSION_SCHEMA });
-        
-        this._presence = new GnomeSession.Presence();
-        this._presence.connect('StatusChanged',
-                               Lang.bind(this, this._onSessionStatusChanged));
+        this._screenSaver = null;
 
+
+        this.connect('destroy', Lang.bind(this, this._onDestroy));
+        
         // Draw the timer
         this._updateTimer();
     },
@@ -308,24 +328,15 @@ Indicator.prototype = {
         let notificationSection = new PopupMenu.PopupMenuSection();
         this._optionsMenu.menu.addMenuItem(notificationSection);
 
-        // Dialog Message toggle
-        let showCountdownTimerToggle = new PopupMenu.PopupSwitchMenuItem
-            (_("Show Countdown Timer"), this._showCountdownTimer);
-        showCountdownTimerToggle.connect("toggled", Lang.bind(this, function() {
-            this._showCountdownTimer = !(this._showCountdownTimer);
+        // Away From Desk toggle
+        let awayFromDeskToggle = new PopupMenu.PopupSwitchMenuItem
+            (_("Away From Desk"), this._awayFromDesk);
+        awayFromDeskToggle.connect("toggled", Lang.bind(this, function(item) {
+            this._awayFromDesk = item.state;
             this._onConfigUpdate(false);
         }));
-        showCountdownTimerToggle.actor.tooltip_text = "Make the pomodoro timer count down to zero";
-        notificationSection.addMenuItem(showCountdownTimerToggle);
-
-        // ShowMessages option toggle
-        let showNotificationMessagesToggle = new PopupMenu.PopupSwitchMenuItem(_("Show Notification Messages"), this._showNotificationMessages);
-        showNotificationMessagesToggle.connect("toggled", Lang.bind(this, function() {
-            this._showNotificationMessages = !(this._showNotificationMessages);
-            this._onConfigUpdate(false);
-        }));
-        showNotificationMessagesToggle.actor.tooltip_text = "Show notification messages in the gnome-shell taskbar";
-        notificationSection.addMenuItem(showNotificationMessagesToggle);
+        awayFromDeskToggle.actor.tooltip_text = "Set optimal settings for doing paperwork";
+        notificationSection.addMenuItem(awayFromDeskToggle);
 
         // Dialog Message toggle
         let breakMessageToggle = new PopupMenu.PopupSwitchMenuItem
@@ -395,16 +406,28 @@ Indicator.prototype = {
 
     // Handle the style related properties in the timer label. These properties are dependent on
     // font size/theme used by user, we need to calculate them during runtime
-    _onTimerRealize: function(actor) {
-        let context = actor.get_pango_context();
-        let themeNode = actor.get_theme_node();
-        let font = themeNode.get_font();
-        let metrics = context.get_metrics(font, context.get_language());
-        let digit_width = metrics.get_approximate_digit_width() / Pango.SCALE;
-        let char_width = metrics.get_approximate_char_width() / Pango.SCALE;
+    _getPreferredWidth: function(actor, forHeight, alloc) {
+        let theme_node = actor.get_theme_node();
+        let min_hpadding = theme_node.get_length('-minimum-hpadding');
+        let natural_hpadding = theme_node.get_length('-natural-hpadding');
 
-        // predict by the number of characters and digits we have in the label
-        actor.width = parseInt(digit_width * 6 + 2.4 * char_width);
+        let context     = actor.get_pango_context();
+        let font        = theme_node.get_font();
+        let metrics     = context.get_metrics(font, context.get_language());
+        let digit_width = metrics.get_approximate_digit_width() / Pango.SCALE;
+        let char_width  = metrics.get_approximate_char_width() / Pango.SCALE;
+        
+        let predicted_width        = parseInt(digit_width * 6 + 2.4 * char_width);
+        let predicted_min_size     = predicted_width + 2 * min_hpadding;
+        let predicted_natural_size = predicted_width + 2 * natural_hpadding;        
+
+        PanelMenu.Button.prototype._getPreferredWidth.call(this, actor, forHeight, alloc); // output stored in alloc
+
+        if (alloc.min_size < predicted_min_size)
+            alloc.min_size = predicted_min_size;
+        
+        if (alloc.natural_size < predicted_natural_size)
+            alloc.natural_size = predicted_natural_size;
     },
 
     // Handles option changes in the UI, saves the configuration
@@ -415,31 +438,11 @@ Indicator.prototype = {
 
         this._saveConfig();
     },
-
-    _getSessionIdleDelay: function() {
-        return this._sessionSettings.get_uint(SESSION_IDLE_DELAY_KEY);
+    
+    _onDestroy: function() {
+        this._stopTimer();
     },
     
-    _onSessionStatusChanged: function(presence, status) {
-        this._isIdle = (status == GnomeSession.PresenceStatus.IDLE);
-        if (this._isIdle)
-            this._notifiedIdle = false;
-        
-        if (this._isRunning) {
-            // Invalidate pomodoro if was idle from the start
-            if (this._isIdle &&
-                this._isPause == false &&
-                this._timeSpent < this._getSessionIdleDelay()-1) // -1 second is to ignore clicks from timer switch
-            {
-                this._isPause = true;
-                this._pauseCount -= 1;
-                this._timeSpent = this._pauseTime + this._timeSpent;
-                this._notifiedIdle = true;
-            }
-            this._updateTimer();
-        }
-    },
-
     // Skip break or reset current pomodoro
     _startNewPomodoro: function() {
         if (this._isPause)
@@ -468,13 +471,6 @@ Indicator.prototype = {
         return false;
     },
 
-    _createNotificationSource: function() {
-        let source = new MessageTray.SystemNotificationSource();
-        source.setTitle(_('Pomodoro Timer'));
-        Main.messageTray.add(source);
-        return source;
-    },
-
     _closeNotification: function() {
         if (this._notification != null) {
             this._notification.destroy(MessageTray.NotificationDestroyedReason.SOURCE_CLOSED);
@@ -488,9 +484,12 @@ Indicator.prototype = {
     _notifyPomodoroStart: function(text, force) {
         this._closeNotification();
 
-        if (this._showNotificationMessages || force) {
-            let source = this._createNotificationSource ();
-            this._notification = new MessageTray.Notification(source, text);
+        //if (!this._awayFromDesk)
+        //    this._deactivateScreenSaver();
+
+        if (true) {
+            let source = new NotificationSource();
+            this._notification = new MessageTray.Notification(source, text, null);
             this._notification.setTransient(true);
             
             source.notify(this._notification);
@@ -503,21 +502,27 @@ Indicator.prototype = {
     _notifyPomodoroEnd: function(text, hideDialog) {
         this._closeNotification();
 
-        if (this._showDialogMessages && hideDialog != true) {
-            this._dialog.open();
+        if (this._awayFromDesk && hideDialog != true) {
+            this._deactivateScreenSaver();
+            this._playNotificationSound();
         }
-        else{
-            if (this._showNotificationMessages || hideDialog) {
-                let source = this._createNotificationSource ();
-                this._notification = new MessageTray.Notification(source, text, null);
-                this._notification.setResident(true);
-                this._notification.addButton(1, _('Start a new Pomodoro'));
-                this._notification.connect('action-invoked', Lang.bind(this, function(param) {
-                            this._startNewPomodoro();
-                        })
-                    );
-                source.notify(this._notification);
-            }
+
+        if (this._showDialogMessages && hideDialog != true) {
+            if (this._dialog.open())
+                return;
+            else
+                ; // Show regular notification as a fallback
+        }
+        
+        if (true) {
+            let source = new NotificationSource();
+            this._notification = new MessageTray.Notification(source, text, null);
+            this._notification.setResident(true);
+            this._notification.addButton(1, _('Start a new Pomodoro'));
+            this._notification.connect('action-invoked', Lang.bind(this, function(param) {
+                    this._startNewPomodoro();
+                }));
+            source.notify(this._notification);
         }
     },
 
@@ -546,11 +551,20 @@ Indicator.prototype = {
         }
     },
 
+    _deactivateScreenSaver: function() {
+        if (this._screenSaver != null) {
+            this._screenSaver.SetActive(false);
+            try{
+                Util.trySpawnCommandLine("xdg-screensaver reset");
+            }catch (err){
+                global.logError("Pomodoro: Error waking up screen: " + err.message);
+            }
+        }
+    },
+    
     // Toggle timer state
     _toggleTimerState: function(item) {
         this._timeSpent = 0;
-        this._minutes = 0;
-        this._seconds = 0;
         this._isPause = false;
         
         if (item.state)
@@ -560,18 +574,24 @@ Indicator.prototype = {
     },
     
     _startTimer: function() {
-        if (this._timerSource == undefined) {
+        if (this._timerSource == undefined)
             this._timerSource = Mainloop.timeout_add_seconds(1, Lang.bind(this, this._refreshTimer));
-            this._isRunning = true;
 
-	    // Trigger dbus signals
-	    if ( this._isPause )
-		this._dbus_server._emitBreak_start(this._pauseTime - this_timeSpent);
-	    else
-		this._dbus_server._emitWorksession_start(this._pomodoroTime - this._timeSpent);
+        this._isRunning = true;
 
-            this._updateTimer();
-            this._updateSessionCount();
+	// Trigger dbus signals
+	if ( this._isPause )
+	    this._dbus_server._emitBreak_start(this._pauseTime - this_timeSpent);
+	else
+	    this._dbus_server._emitWorksession_start(this._pomodoroTime - this._timeSpent);
+
+
+        this._updateTimer();
+        this._updateSessionCount();
+
+        if (this._screenSaver == null) {
+            this._screenSaver = new ScreenSaver.ScreenSaverProxy();
+            //this._screenSaver.connect('ActiveChanged', Lang.bind(this, this._setIdle));
         }
     },
 
@@ -579,13 +599,90 @@ Indicator.prototype = {
         if (this._timerSource != undefined) {
             GLib.source_remove(this._timerSource);
             this._timerSource = undefined;
-            this._isRunning = false;	    
-            this._updateTimer();
-            this._updateSessionCount();
-            this._closeNotification();
+        }
+        this._isRunning = false;
+
+	// Trigger dbus signals
+	if ( this._isPause )
+	    this._dbus_server._emitBreak_end();
+	else
+	    this._dbus_server._emitWorksession_end();
+
+        this._setIdle(false);
+        this._updateTimer();
+        this._updateSessionCount();            
+        this._closeNotification();            
+        
+        this._screenSaver = null;
+    },
+
+    _suspendTimer: function() {
+        if (this._timerSource != undefined) {
+            // Stop timer
+            GLib.source_remove(this._timerSource);
+            this._timerSource = undefined;
+
+            this._setIdle(true);
         }
     },
 
+    _setIdle: function(active) {
+        this._isIdle = active;
+        if (active) {
+            // We use meta_display_get_last_user_time() which determines any user interaction 
+            // with X11/Mutter windows but not with GNOME Shell UI, for that we handle 'captured-event'.
+            if (this._eventCaptureId == 0)
+                this._eventCaptureId = global.stage.connect('captured-event', Lang.bind(this, this._onEventCapture));
+            
+            if (this._eventCaptureSource == 0) {
+                this._pointer = null;
+                this._eventCaptureSource = Mainloop.timeout_add_seconds(1, Lang.bind(this, this._onX11EventCapture));
+            }
+        }
+        else{
+            global.stage.disconnect(this._eventCaptureId);
+            this._eventCaptureId = 0;
+
+            GLib.source_remove(this._eventCaptureSource);
+            this._eventCaptureSource = 0;
+            
+            if (this._isRunning)
+                this._startTimer();
+        }
+    },
+
+    _onEventCapture: function(actor, event) {
+        // When notification dialog fades out, can trigger an event.
+        // To avoid that we need to capture just these event types:
+        switch(event.type()) {
+            case Clutter.EventType.KEY_PRESS:
+            case Clutter.EventType.BUTTON_PRESS:
+            case Clutter.EventType.MOTION:
+            case Clutter.EventType.SCROLL:
+                this._setIdle(false);
+                break;
+        }
+        return false;
+    },
+
+    _onX11EventCapture: function() {
+        let display = global.screen.get_display();
+        let pointer = global.get_pointer();
+        let idleTime = parseInt((display.get_current_time_roundtrip() - display.get_last_user_time()) / 1000);
+        
+        if (idleTime < 1 || (this._pointer != null && (pointer[0] != this._pointer[0] || pointer[1] != this._pointer[1]))) {
+            this._setIdle(false);
+            
+            // Treat last non-idle second as if timer was running.
+            this._refreshTimer();
+
+            return false;
+        }
+        
+        this._pointer = pointer;
+        return true;
+    },
+    
     // Increment timeSpent and call functions to check timer states and update ui_timer    
     _refreshTimer: function() {
         if (this._isRunning) {
@@ -604,16 +701,14 @@ Indicator.prototype = {
             // Check if a pause is running..
             if (this._isPause == true) {
                 // Check if the pause is over
-                if (this._timeSpent >= this._pauseTime && this._isIdle != true) {
+                if (this._timeSpent >= this._pauseTime) {
                     this._timeSpent = 0;
                     this._isPause = false;
-                    if (this._notifiedIdle == false)
-                        this._notifyPomodoroStart(_('Pause finished, a new pomodoro is starting!'));
                     this._updateSessionCount();
-                }
-                else if (this._timeSpent >= this._pauseTime && this._isIdle && this._notifiedIdle != true) {
-                    this._notifiedIdle = true;
                     this._notifyPomodoroStart(_('Pause finished, a new pomodoro is starting!'));
+                    
+                    if (!this._awayFromDesk)
+                        this._suspendTimer();
                 }
                 else{
                     if (this._pauseCount == 0)
@@ -637,9 +732,10 @@ Indicator.prototype = {
                     this._notifyPomodoroEnd(_('Pomodoro finished, take a break!'));
                 }
 
+		// Trigger dbus signals
+		this._dbus_server._emitWorksession_end();
+
                 this._timeSpent = 0;
-                this._minutes = 0;
-                this._seconds = 0;
                 this._sessionCount += 1;
                 this._isPause = true;
                 this._updateSessionCount();
@@ -668,23 +764,20 @@ Indicator.prototype = {
         this._checkTimerState();
 
         if (this._isRunning) {
-            let seconds = this._timeSpent;
-            if (this._showCountdownTimer == true)
-                seconds = Math.max((this._isPause ? this._pauseTime : this._pomodoroTime) - this._timeSpent, 0);
+            let secondsLeft = Math.max((this._isPause ? this._pauseTime : this._pomodoroTime) - this._timeSpent, 0);
             
-            this._minutes = parseInt(seconds / 60);
-            this._seconds = parseInt(seconds % 60);
+            let minutes = parseInt(secondsLeft / 60);
+            let seconds = parseInt(secondsLeft % 60);
 
-            timer_text = "[%02d] %02d:%02d".format(this._sessionCount, this._minutes, this._seconds);
+            timer_text = "[%02d] %02d:%02d".format(this._sessionCount, minutes, seconds);
             this._timer.set_text(timer_text);
 
             if (this._isPause && this._showDialogMessages)
             {
-                seconds = this._pauseTime - this._timeSpent;
-                if (seconds < 47)
-                    this._descriptionLabel.text = _("Take a break! You have %d seconds\n").format(Math.round(seconds / 5) * 5);
+                if (secondsLeft < 47)
+                    this._descriptionLabel.text = _("Take a break! You have %d seconds\n").format(Math.round(secondsLeft / 5) * 5);
                 else
-                    this._descriptionLabel.text = _("Take a break! You have %d minutes\n").format(Math.round(seconds / 60));
+                    this._descriptionLabel.text = _("Take a break! You have %d minutes\n").format(Math.round(secondsLeft / 60));
             }
         }
         else{
@@ -793,6 +886,9 @@ Indicator.prototype = {
 // Extension initialization code
 function init(metadata) {
     //imports.gettext.bindtextdomain('gnome-shell-pomodoro', metadata.localedir);
+    
+    // search for icons inside extension directory
+    Gtk.IconTheme.get_default().append_search_path (metadata.path);
 }
 
 let _indicator;
